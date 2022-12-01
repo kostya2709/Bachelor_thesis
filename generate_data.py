@@ -37,4 +37,6 @@ KNOWN_NUM = 12
 if __name__ == "__main__":
 
     point_range = get_range( LEFT, RIGHT, POINTS_NUM)
+    for i in point_range:
+        print(point_range)
     write_answer( "data", "pred", point_range, SAMPLE_NUM, KNOWN_NUM)

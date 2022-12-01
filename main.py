@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader, RandomSampler
+import matplotlib.pyplot as plt
 
 from pytorch_lightning import LightningModule
 from pytorch_lightning import Trainer
@@ -54,7 +55,7 @@ class TrajDataset(Dataset):
         return len( self.data)
     
     def __getitem__(self, index):
-        return torch.tensor(self.data[index]), torch.tensor(self.targets[index])
+        return torch.tensor(self.data[index])[..., None], torch.tensor(self.targets[index])[..., None]
 
 
 class TrajAccuracy:
@@ -63,14 +64,15 @@ class TrajAccuracy:
         self.value_end = []
 
     def update( self, pred, ground_truth):
-        self.value_all.append( mean_squared_error( pred, ground_truth))
-        self.value_end.append( mean_squared_error( pred[-1], ground_truth[-1]))
+        diff = torch.linalg.norm( pred - ground_truth, dim=-1)
+        self.value_all.append( torch.mean(diff).item())
+        self.value_end.append( torch.mean(diff[:, -1]).item())
     
     def __str__(self):
-        return str( "All: {}, end: {}", self.value_all, self.value_end)
+        return f"All: {self.value_all[-1]}, end: {self.value_end[-1]}"
     
     def compute( self):
-        return str( "All: {}, end: {}", np.mean(self.value_all), np.mean(self.value_end))
+        return f"All: {np.mean(self.value_all)}, end: {np.mean(self.value_end)}"
 
 
 class LSTM_Model(LightningModule):
@@ -82,13 +84,14 @@ class LSTM_Model(LightningModule):
         self.test_accuracy = TrajAccuracy()
 
         self.embeddings_layer = nn.Linear( 1, embedding_dim)
-        self.lstm_layer = nn.LSTM(embedding_dim, embedding_dim, batch_first=True)
+        self.lstm_layer = nn.LSTM(embedding_dim, embedding_dim, bidirectional=True, batch_first=True)
         self.dropout_layer = nn.Dropout(0.2)
-        self.out_layer = nn.Linear(2 * embedding_dim, pred_num)
+        self.out_layer = nn.Linear( 2 * embedding_dim, pred_num)
     
     def forward(self, inputs, labels):
+        # inputs: batch_size * seq_len * state_dim
         batch_size = inputs.size(0)
-        projections = self.embeddings_layer(inputs)
+        projections = self.embeddings_layer(inputs) # batch_size * seq_len * embedding_dim
 
         # batch_size x seq_len x embedding_dim
         output, (final_hidden_state, final_cell_state) = self.lstm_layer(projections)
@@ -101,7 +104,7 @@ class LSTM_Model(LightningModule):
 
         # batch_size x 2*embedding_dim
         hidden = self.dropout_layer(final_hidden_state)
-        results = self.out_layer(hidden)
+        results = self.out_layer(hidden)[..., None]
         loss = self.loss(results, labels.float())
         return loss, results
     
@@ -119,21 +122,54 @@ class LSTM_Model(LightningModule):
         inputs, labels = batch
         val_loss, results = self(inputs, labels)
         self.valid_accuracy.update(results, labels)
-        self.log("val_loss", val_loss, prog_bar=True)
-        self.log("val_acc", self.valid_accuracy)
+        # self.log("val_loss", val_loss, prog_bar=True)
+        # self.log("val_acc", self.valid_accuracy)
 
     def validation_epoch_end(self, outs):
-        self.log("val_acc_epoch", self.valid_accuracy.compute(), prog_bar=True)
+        print("Validation epoch end:", self.valid_accuracy.compute())
+        # self.log("val_acc_epoch", self.valid_accuracy.compute(), prog_bar=True)
 
     def test_step(self, batch, _):
         inputs, labels = batch
         test_loss, results = self(inputs, labels)
         self.test_accuracy.update(results, labels)
-        self.log("test_loss", test_loss, prog_bar=True)
-        self.log("test_acc", self.test_accuracy)
+        # self.log("test_loss", test_loss, prog_bar=True)
+        # self.log("test_acc", self.test_accuracy)
 
     def test_epoch_end(self, outs):
-        self.log("test_acc_epoch", self.test_accuracy.compute(), prog_bar=True)
+        print("Test epoch end:", self.valid_accuracy.compute())
+        # self.log("test_acc_epoch", self.test_accuracy.compute(), prog_bar=True)
+
+
+def draw( inputs, labels, results):
+    left = 0
+    right = 15
+    points_num = 20
+    step = (right - left) / points_num
+    x = np.arange( left, right, step)
+
+    input = list(inputs[0, :, 0].detach())
+    label = list(labels[0, :, 0].detach())
+    result = list(results[0, :, 0].detach())
+    label.insert(0, input[-1])
+    result.insert(0, input[-1])
+    known = len(input)
+
+    smooth_x = np.arange( left, right, step / 2)
+    sin_x = np.sin(smooth_x)
+    plt.plot(smooth_x, sin_x, label="sin(x)")
+    
+    plt.plot(x[:known], input, label="known data")
+    plt.plot(x[known - 1 : ], label, "r-", label="ground truth")
+    plt.plot(x[known - 1 : ], result, "g--", label="predicted", linewidth=2)
+
+    plt.title("Predictions")
+    plt.xlabel("Time")
+    plt.ylabel("Coordinate")
+    plt.grid(True, which='both')
+    plt.legend()
+
+    plt.savefig("prediction.png")
 
 
 if __name__ == "__main__":
@@ -143,7 +179,7 @@ if __name__ == "__main__":
     train_data, test_data, train_label, test_label = train_test_split( data, target, test_size=0.2, random_state=1)
     train_data, val_data, train_label, val_label = train_test_split( train_data, train_label, test_size=0.2, random_state=1)
 
-    BATCH_SIZE = 32
+    BATCH_SIZE = 2
     PRED_NUM = len(target[0])
     train_data = TrajDataset( train_data, train_label)
     train_sampler = RandomSampler(train_data)
@@ -156,20 +192,25 @@ if __name__ == "__main__":
     test_loader = DataLoader(test_data, batch_size=BATCH_SIZE)
 
     rnn_model = LSTM_Model( PRED_NUM)
-    early_stop_callback = EarlyStopping(
-        monitor="val_loss",
-        min_delta=0.0,
-        patience=1,
-        verbose=True,
-        mode="min" 
-    )
+    # early_stop_callback = EarlyStopping(
+    #     monitor="val_loss",
+    #     min_delta=0.0,
+    #     patience=1,
+    #     verbose=True,
+    #     mode="min" 
+    # )
 
     trainer = Trainer(
-        gpus=1,
+        gpus=0,
         #checkpoint_callback=False,
         accumulate_grad_batches=1,
-        max_epochs=10,
+        max_epochs=50,
         #progress_bar_refresh_rate=10,
-        callbacks=[early_stop_callback])
+        )#callbacks=[early_stop_callback])
+
     trainer.fit(rnn_model, train_loader, val_loader)
     trainer.test(rnn_model, test_loader)
+
+    inputs, labels = next(iter(test_loader))
+    _, results = rnn_model( inputs, labels)
+    draw( inputs, labels, results)
