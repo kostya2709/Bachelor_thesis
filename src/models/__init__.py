@@ -1,1 +1,1 @@
-from src.models.LSTM import LSTM_Model
+from .LSTM import LSTM_Model
